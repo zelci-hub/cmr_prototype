@@ -12,10 +12,10 @@
     "refresh_every": 4,
     "recent_tail_chunks": 2,
     "compare_mode": true,
-    "cache_pre_rotate": false,
+    "cache_pre_rotate": true,
     "dtype": "fp16",
     "device_map": "auto",
-    "output_file": "sanity_B.json",
+    "output_file": "sanity_C.json",
     "verbose": true
   },
   "per_sample": [
@@ -28,16 +28,16 @@
           "num_new_tokens": 33,
           "avg_accept_length": 0.391304347826087,
           "total_accept": 9,
-          "wall_time_s": 0.977,
-          "tokens_per_sec": 33.768
+          "wall_time_s": 0.976,
+          "tokens_per_sec": 33.811
         },
         "cmr_on": {
-          "num_iters": 20,
+          "num_iters": 6,
           "num_new_tokens": 32,
-          "avg_accept_length": 0.55,
-          "total_accept": 11,
-          "wall_time_s": 0.914,
-          "tokens_per_sec": 34.992
+          "avg_accept_length": 4.166666666666667,
+          "total_accept": 25,
+          "wall_time_s": 0.286,
+          "tokens_per_sec": 112.035
         }
       }
     },
@@ -50,16 +50,16 @@
           "num_new_tokens": 33,
           "avg_accept_length": 0.3333333333333333,
           "total_accept": 8,
-          "wall_time_s": 0.97,
-          "tokens_per_sec": 34.026
+          "wall_time_s": 0.928,
+          "tokens_per_sec": 35.563
         },
         "cmr_on": {
-          "num_iters": 21,
+          "num_iters": 6,
           "num_new_tokens": 32,
-          "avg_accept_length": 0.47619047619047616,
-          "total_accept": 10,
-          "wall_time_s": 1.094,
-          "tokens_per_sec": 29.255
+          "avg_accept_length": 4.166666666666667,
+          "total_accept": 25,
+          "wall_time_s": 0.279,
+          "tokens_per_sec": 114.567
         }
       }
     },
@@ -73,15 +73,15 @@
           "avg_accept_length": 0.3333333333333333,
           "total_accept": 8,
           "wall_time_s": 0.935,
-          "tokens_per_sec": 35.3
+          "tokens_per_sec": 35.28
         },
         "cmr_on": {
-          "num_iters": 20,
+          "num_iters": 6,
           "num_new_tokens": 32,
-          "avg_accept_length": 0.55,
-          "total_accept": 11,
-          "wall_time_s": 0.908,
-          "tokens_per_sec": 35.239
+          "avg_accept_length": 4.166666666666667,
+          "total_accept": 25,
+          "wall_time_s": 0.277,
+          "tokens_per_sec": 115.445
         }
       }
     },
@@ -94,16 +94,16 @@
           "num_new_tokens": 33,
           "avg_accept_length": 0.391304347826087,
           "total_accept": 9,
-          "wall_time_s": 0.893,
-          "tokens_per_sec": 36.941
+          "wall_time_s": 0.883,
+          "tokens_per_sec": 37.375
         },
         "cmr_on": {
-          "num_iters": 20,
-          "num_new_tokens": 33,
-          "avg_accept_length": 0.6,
-          "total_accept": 12,
-          "wall_time_s": 0.908,
-          "tokens_per_sec": 36.363
+          "num_iters": 6,
+          "num_new_tokens": 32,
+          "avg_accept_length": 4.166666666666667,
+          "total_accept": 25,
+          "wall_time_s": 0.277,
+          "tokens_per_sec": 115.389
         }
       }
     },
@@ -116,16 +116,16 @@
           "num_new_tokens": 33,
           "avg_accept_length": 0.391304347826087,
           "total_accept": 9,
-          "wall_time_s": 0.894,
-          "tokens_per_sec": 36.902
+          "wall_time_s": 0.883,
+          "tokens_per_sec": 37.358
         },
         "cmr_on": {
-          "num_iters": 20,
-          "num_new_tokens": 33,
-          "avg_accept_length": 0.6,
-          "total_accept": 12,
-          "wall_time_s": 0.908,
-          "tokens_per_sec": 36.347
+          "num_iters": 6,
+          "num_new_tokens": 32,
+          "avg_accept_length": 4.166666666666667,
+          "total_accept": 25,
+          "wall_time_s": 0.277,
+          "tokens_per_sec": 115.551
         }
       }
     }
@@ -133,12 +133,12 @@
   "aggregate": {
     "cmr_off": {
       "mean_avg_accept_length": 0.3681,
-      "mean_tokens_per_sec": 35.387,
+      "mean_tokens_per_sec": 35.877,
       "num_samples": 5
     },
     "cmr_on": {
-      "mean_avg_accept_length": 0.5552,
-      "mean_tokens_per_sec": 34.439,
+      "mean_avg_accept_length": 4.1667,
+      "mean_tokens_per_sec": 114.597,
       "num_samples": 5
     }
   }

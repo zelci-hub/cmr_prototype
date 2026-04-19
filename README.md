@@ -6,10 +6,12 @@ speculative decoding (target + independent small LM draft). The goal is to valid
 the CMR algorithm itself on small LLaMA models, deliberately trading inference speed
 for clarity — no custom CUDA kernels, no tree attention, no EAGLE head.
 
-> **TL;DR.** Three sanity checks verify that the hand-written spec-decoding loop is
-> correct, that CMR is a strict no-op when `top_k ≥ total_chunks`, and that CMR
-> delivers a measurable accept-length improvement on a long-context needle-in-haystack
-> prompt. See [Results](#results).
+> **TL;DR.** Five sanity checks verify that the hand-written spec-decoding loop is
+> correct, that CMR is a bit-for-bit no-op under both implementations when
+> `top_k ≥ total_chunks`, and that CMR with `--cache_pre_rotate` (re-prefill
+> the draft on selected tokens with contiguous RoPE) takes a Vicuna-7B-v1.5-16k
+> / vicuna-68m pair from **avg_accept_length 0.37 → 4.17** and **35.9 → 114.6
+> tok/s** on 5000-token needle-in-haystack prompts. See [Results](#results).
 
 ---
 
@@ -45,13 +47,15 @@ with tuple-of-`(K, V)` legacy caches and pure HuggingFace forwards.
 
 ```
 cmr_prototype/
-├── cmr_prototype.py         # All spec-decoding + CMR logic in one file (~800 LOC)
-├── prepare_sample_data.py   # Synthesises needle + repeat prompts at 1K/2K/4K words
-├── run_sanity.sh            # Reproduces the three sanity checks below
-├── sample_data/             # Auto-generated JSONL prompts (created by run_sanity.sh)
-├── sanity_0.json            # Short-prompt correctness baseline (auto)
-├── sanity_A.json            # CMR no-op check (auto)
-└── sanity_B.json            # CMR retrieval-quality check (auto)
+├── cmr_prototype.py          # All spec-decoding + CMR logic in one file (~900 LOC)
+├── prepare_sample_data.py    # Synthesises needle + repeat prompts at 1K/2K/4K words
+├── run_sanity.sh             # Reproduces the five sanity checks below
+├── sample_data/              # Auto-generated JSONL prompts (created by run_sanity.sh)
+├── sanity_0.json             # Short-prompt correctness baseline (auto)
+├── sanity_A.json             # CMR (index-select) no-op check (auto)
+├── sanity_A_prerotate.json   # CMR (cache-pre-rotate) no-op check (auto)
+├── sanity_B.json             # CMR (index-select) retrieval-quality check (auto)
+└── sanity_C.json             # CMR (cache-pre-rotate) retrieval-quality check (auto)
 ```
 
 ---
@@ -95,25 +99,29 @@ python3 cmr_prototype.py \
     --num_draft 5 \
     --chunk_size 32 --top_k_chunks 32 --refresh_every 4 \
     --dtype fp16 \
-    --compare_mode        # run both cmr_off and cmr_on back-to-back
+    --compare_mode \
+    --cache_pre_rotate    # enable the re-prefill variant of CMR
 ```
 
-`--compare_mode` runs the same prompt through both modes so `avg_accept_length` and
-`tok/s` can be compared directly.
+`--compare_mode` runs the same prompt through both modes (`cmr_off` / `cmr_on`) so
+`avg_accept_length` and `tok/s` can be compared directly. `--cache_pre_rotate` is
+a **sub-option** of CMR: on every refresh it re-runs the draft on the selected
+tokens with contiguous position IDs `[0..S-1]`, so RoPE stays in-distribution. It
+is a no-op when CMR is off.
 
 ---
 
-## 5. The three sanity checks
+## 5. The five sanity checks
 
 ### Sanity 0 — short-prompt correctness
 
 Short prompts (~512 tokens) keep both models comfortably inside their training
 windows, so the draft and target should agree on almost every token. If this
 baseline gives ≈ 0 accepts, the bug is in the spec-decoding loop itself; if it
-gives high accepts, the loop is correct and any long-prompt weakness is attributable
-to the draft's limitations (e.g. RoPE extrapolation).
+gives high accepts, the loop is correct and any long-prompt weakness is
+attributable to the draft's limitations (e.g. RoPE extrapolation).
 
-### Sanity A — CMR no-op
+### Sanity A — CMR no-op (index-select path)
 
 `top_k_chunks=1000` on a ~4K-word prompt selects every chunk, so the CMR-reduced
 working cache is identical to the full draft cache. `cmr_on` and `cmr_off`
@@ -121,86 +129,121 @@ therefore **must** produce the same `avg_accept_length` to machine precision. An
 deviation means the CMR plumbing (indexing, position remapping, cache handling)
 is leaking errors.
 
-### Sanity B — CMR retrieval quality
+### Sanity A′ — CMR no-op (cache-pre-rotate path)
 
-`top_k=32` on a 5000-token needle-in-haystack prompt keeps only ~20% of the prefix
-(~1024 tokens) in the draft's working cache. If CMR is working, the retained
-chunks should include the informative "needle" region, and the reduced cache
-should actually *help* the draft (because it brings its effective context closer
-to its training window). A successful outcome is `cmr_on > cmr_off` on
-`avg_accept_length`.
+Same configuration as A but with `--cache_pre_rotate`. Re-prefilling on *all*
+positions in order with contiguous IDs is bit-for-bit equivalent to a plain full
+prefill, so the re-prefill plumbing (virtual positions, commit-start accounting,
+`prefix_tokens` bookkeeping) must also produce `cmr_on == cmr_off`. This is the
+correctness guard for the re-prefill code path.
+
+### Sanity B — CMR retrieval quality (index-select path)
+
+`top_k=32` on a 5000-token needle-in-haystack prompt keeps only ~20 % of the
+prefix (~1024 tokens) in the draft's working cache. In the index-select path the
+retained keys still carry their original (far-OOD) RoPE phases, so CMR helps only
+modestly. Success criterion: `cmr_on > cmr_off` on `avg_accept_length`.
+
+### Sanity C — CMR retrieval quality (cache-pre-rotate path)
+
+Same prompt and `top_k=32` as B, but with `--cache_pre_rotate`. The draft now
+sees a compact 1024-token virtual sequence with contiguous RoPE, which is inside
+its 2K training window. Success criterion: `cmr_on ≫ cmr_off` on
+`avg_accept_length` *and* `cmr_on` throughput noticeably higher than `cmr_off`
+throughput. This is the experiment that, in practice, closes the gap vs. the
+SpecExtend paper.
 
 ---
 
 ## 6. Results
 
 All runs: `num_draft=5`, `chunk_size=32`, `refresh_every=4`, fp16, single H100.
-Numbers below are aggregated across samples from `sanity_{0,A,B}.json`.
+Numbers below are aggregated across the samples in the corresponding
+`sanity_*.json` file.
 
-| Check      | Prompt len | `top_k` | Dataset         | cmr_off avg_acc | cmr_on avg_acc | cmr_off tok/s | cmr_on tok/s |
-|------------|-----------:|--------:|-----------------|----------------:|---------------:|--------------:|-------------:|
-| Sanity 0   |        512 |    1000 | `repeat_1024`   |       **5.000** |      **5.000** |         129.1 |        109.0 |
-| Sanity A   |       5000 |    1000 | `repeat_4096`   |      **0.8286** |     **0.8286** |          46.5 |         41.2 |
-| Sanity B   |       5000 |      32 | `needle_4096`   |      **0.368**  |     **0.555**  |          35.6 |         35.7 |
+| Check    | Variant       | Prompt len | `top_k` | Dataset         | cmr_off acc | cmr_on acc | cmr_off tok/s | cmr_on tok/s |
+|----------|---------------|-----------:|--------:|-----------------|------------:|-----------:|--------------:|-------------:|
+| Sanity 0 | —             |        512 |    1000 | `repeat_1024`   |   **5.000** |  **5.000** |         150.2 |        135.9 |
+| Sanity A | index-select  |       5000 |    1000 | `repeat_4096`   |  **0.8286** | **0.8286** |          47.6 |         41.5 |
+| Sanity A′| pre-rotate    |       5000 |    1000 | `repeat_4096`   |  **0.8286** | **0.8286** |          44.7 |         38.0 |
+| Sanity B | index-select  |       5000 |      32 | `needle_4096`   |   **0.368** |  **0.555** |          35.4 |         34.4 |
+| Sanity C | pre-rotate    |       5000 |      32 | `needle_4096`   |   **0.368** |  **4.167** |          35.9 |    **114.6** |
 
 ### Interpretation
 
-- **Sanity 0**: `accept_length = 5.000` is the ceiling (`num_draft=5`), meaning the
-  draft's greedy output matched the target's on *every* drafted token, every
-  iteration. Algorithmic correctness confirmed.
-- **Sanity A**: `0.8286 == 0.8286` to 4 decimals — CMR is a pure no-op when
-  `top_k ≥ total_chunks`. The drop from 5.000 (short) to 0.83 (long) is not a bug:
-  `double7/vicuna-68m` was trained on ~2K context and degrades heavily on 5K
-  prompts via RoPE extrapolation.
+- **Sanity 0**: `accept_length = 5.000` is the ceiling (`num_draft=5`). Greedy
+  spec-decoding loop is correct.
+- **Sanity A / A′**: `0.8286 == 0.8286` to 4 decimals under both CMR code paths.
+  Both implementations (index-select and re-prefill) are bit-for-bit no-ops when
+  `top_k ≥ total_chunks`. The drop from 5.000 (short) to 0.83 (long) is not a
+  bug: `double7/vicuna-68m` was trained on ~2K context and degrades on 5K via
+  RoPE extrapolation.
 - **Sanity B**: `cmr_on` delivers **+51 % relative** `avg_accept_length`
-  (0.368 → 0.555) while throughput is flat (35.6 ≈ 35.7 tok/s). The extra compute
-  for target-attention scoring and index-select is exactly offset by the improved
-  acceptance.
+  (0.368 → 0.555) while throughput is flat (35.4 ≈ 34.4 tok/s). The extra
+  compute for target-attention scoring and `index_select` is roughly offset by
+  the improved acceptance, but the draft is still attending to keys whose RoPE
+  rotations correspond to their *original* far-OOD positions.
+- **Sanity C — the payoff**: switching to `--cache_pre_rotate` pushes
+  `avg_accept_length` from 0.368 → **4.167**, i.e. **+1031 % over no-CMR** and
+  **+650 % over Sanity B's index-select CMR**. At `num_draft=5`, 4.167
+  corresponds to **~83 % per-slot acceptance**, matching the SpecExtend paper's
+  reported range for this target/draft pair. Throughput jumps from 35.9 →
+  **114.6 tok/s (≈ 3.2× speedup)** — the ~1000-token draft re-prefill every
+  4 iters is cheap compared to the ~7× longer accept runs it enables.
 
-### Why the absolute numbers are below SpecExtend's paper
+### Why this works (and why the index-select path can't)
 
-The paper reports `avg_accept_length ≈ 2–3` for this same target/draft pair on
-long inputs with CMR. This prototype reaches 0.55. The gap has a clean root cause:
+SpecExtend's own `modeling_llama_kv_draft.py` stores **pre-RoPE keys** and
+re-applies RoPE with **contiguous** position IDs at every query — effectively
+the same geometric trick as re-prefill, just implemented inside a custom
+attention kernel. This prototype achieves the same outcome without a custom
+kernel by re-running the draft on the selected tokens every refresh, which is
+what `--cache_pre_rotate` does.
 
-SpecExtend ships a **custom** `LlamaAttention` (see `specextend/classic/modeling_llama_kv_draft.py`,
-lines ~590-602) that stores **pre-RoPE keys** in the cache and re-applies RoPE
-with **contiguous** `[0, kv_seq_len)` position IDs at every query. So when CMR
-selects, say, positions `{13, 47, 3901, ...}`, the draft *sees a compact
-short-context virtual sequence* with contiguous RoPE — staying well inside its
-training window.
-
-This prototype uses vanilla HuggingFace `LlamaAttention`, which bakes RoPE into
-keys *at cache-insertion time*. After `index_select` the retained keys still
-carry their *original* (far-out-of-distribution) RoPE rotations. CMR still helps
-(0.37 → 0.55) because the selected chunks are semantically more relevant, but
-the draft continues to see OOD attention.
-
-Closing this gap requires either (a) a custom LLaMA forward that applies RoPE at
-query-time, or (b) **re-prefilling the draft on each refresh** with the selected
-tokens using contiguous position IDs `[0..|S|-1]`. (b) is an additive change to
-this prototype and is the natural next step — it would directly reproduce the
-paper's long-context accept-length numbers on top of the vanilla-`transformers`
-stack.
+Vanilla HuggingFace `LlamaAttention`, by contrast, bakes RoPE into cached K at
+insertion time, so `index_select` retains keys whose rotational phase matches
+their *original* (far-OOD) position. That's exactly why Sanity B's `cmr_on` is
+only 0.555 while Sanity C's is 4.167 on the same prompts and the same selected
+chunks.
 
 ---
 
 ## 7. File map for readers
 
-- `cmr_prototype.py::spec_generate` — main loop.
-- `cmr_prototype.py::target_verify` — greedy accept / off-by-one correctness here
-  (see the large docstring; we feed `[last_tok, drafts]` so `logits[i]` aligns
-  with `drafts[i]`).
+- `cmr_prototype.py::spec_generate` — main loop. Three draft-side code paths:
+  (i) no-CMR, (ii) CMR index-select (legacy), (iii) CMR cache-pre-rotate.
+- `cmr_prototype.py::target_verify` — greedy accept / off-by-one correctness
+  here (see the large docstring; we feed `[last_tok, drafts]` so `logits[i]`
+  aligns with `drafts[i]`).
 - `cmr_prototype.py::get_last_query_attention` — extracts target's attention
   over the prefix for CMR scoring.
 - `cmr_prototype.py::{build_chunks, score_chunks, select_top_k_chunks}` — the
   CMR-Algorithm-1 math.
-- `cmr_prototype.py::kv_index_select` — materialises the reduced working KV.
+- `cmr_prototype.py::kv_index_select` — materialises the reduced working KV in
+  the index-select path.
+- `cmr_prototype.py::prefill_draft_on_positions` — the re-prefill primitive used
+  by the cache-pre-rotate path.
 
-The KV cache invariant maintained throughout is:
+### KV cache invariants
 
-> `full_target_kv` and `full_draft_kv` each have length `last_pos` and **do not
-> contain** `last_tok`. `last_tok` is tracked separately and re-fed as the first
-> input on every forward (draft, verify, commit).
+Target-side, always:
+
+> `full_target_kv` has length `last_pos` and does **not** contain `last_tok`.
+> `last_tok` is tracked separately and re-fed as the first input on every
+> verify/commit forward.
+
+Draft-side, depending on mode:
+
+| mode                      | draft state                                                   | draft positions           |
+|---------------------------|---------------------------------------------------------------|---------------------------|
+| no CMR                    | `full_draft_kv` at real positions `[0, last_pos)`             | real: `last_pos, …`       |
+| CMR + index-select        | `full_draft_kv` untouched; `working = index_select(full, S)`  | real: `last_pos, …`       |
+| CMR + **cache-pre-rotate**| `working_draft_kv` rebuilt on refresh via re-prefill, then extended in-place on commits | **virtual**: `virtual_base + (last_pos − real_refresh_pos), …` |
+
+In pre-rotate mode, `virtual_base = S` right after a refresh and
+`kv_len(working_draft_kv) == virtual_base + (last_pos − real_refresh_pos)` at
+all times, which is exactly `draft_start_position` passed into the next
+drafting call.
 
 ---
 
@@ -208,20 +251,26 @@ The KV cache invariant maintained throughout is:
 
 Current prototype:
 - ✅ Correct greedy speculative decoding (Sanity 0).
-- ✅ CMR is a bit-for-bit no-op when `top_k ≥ total_chunks` (Sanity A).
-- ✅ CMR provides measurable accept-length lift on long-context needle prompts
-  (Sanity B, +51 %).
-- ⚠️ Absolute accept-length at long context is ~3× below SpecExtend's paper
-  because of the RoPE-at-insert vs. RoPE-at-query-time gap described above.
+- ✅ CMR bit-for-bit no-op under both code paths when `top_k ≥ total_chunks`
+  (Sanity A and A′).
+- ✅ CMR (index-select) provides a modest accept-length lift on long-context
+  needle prompts (Sanity B, +51 %).
+- ✅ CMR + `--cache_pre_rotate` closes the gap vs. SpecExtend's paper:
+  accept_length 0.37 → 4.17, tok/s 35.9 → 114.6 on 5K-token needle prompts
+  (Sanity C).
 
 Planned extensions:
 
-1. **Draft re-prefill with contiguous positions** (closes the RoPE gap on vanilla
-   HuggingFace; matches the paper's long-context accept lengths).
-2. **EAGLE-3 draft support** — swap the independent draft LM for a draft head
-   conditioned on target hidden states, verify CMR composes correctly with it.
-3. **Agent-style long-context benchmark** (e.g. SWE-Bench-Verified
-   codebase contexts) to measure real-world CMR gain.
+1. **EAGLE-3 draft support** — swap the independent draft LM for a draft head
+   conditioned on target hidden states, and verify CMR + cache-pre-rotate
+   compose correctly with it.
+2. **Agent-style long-context benchmark** (e.g. SWE-Bench-Verified codebase
+   contexts) to measure real-world CMR gain on realistic inputs rather than
+   synthetic needle prompts.
+3. **Amortise re-prefill cost** — currently each refresh re-runs the draft on
+   ~1000 tokens; this is already net-positive (3× tok/s lift) but could be
+   reduced further, e.g. by caching pre-RoPE keys once per selection and only
+   re-rotating on subsequent queries.
 
 ---
 

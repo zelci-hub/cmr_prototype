@@ -12,6 +12,7 @@
     "refresh_every": 4,
     "recent_tail_chunks": 2,
     "compare_mode": true,
+    "cache_pre_rotate": false,
     "dtype": "fp16",
     "device_map": "auto",
     "output_file": "sanity_0.json",
@@ -27,16 +28,16 @@
           "num_new_tokens": 67,
           "avg_accept_length": 5.0,
           "total_accept": 55,
-          "wall_time_s": 0.615,
-          "tokens_per_sec": 108.992
+          "wall_time_s": 0.527,
+          "tokens_per_sec": 127.04
         },
         "cmr_on": {
           "num_iters": 11,
           "num_new_tokens": 67,
           "avg_accept_length": 5.0,
           "total_accept": 55,
-          "wall_time_s": 0.572,
-          "tokens_per_sec": 117.103
+          "wall_time_s": 0.496,
+          "tokens_per_sec": 135.176
         }
       }
     },
@@ -49,16 +50,16 @@
           "num_new_tokens": 67,
           "avg_accept_length": 5.0,
           "total_accept": 55,
-          "wall_time_s": 0.541,
-          "tokens_per_sec": 123.837
+          "wall_time_s": 0.414,
+          "tokens_per_sec": 161.716
         },
         "cmr_on": {
           "num_iters": 11,
           "num_new_tokens": 67,
           "avg_accept_length": 5.0,
           "total_accept": 55,
-          "wall_time_s": 0.62,
-          "tokens_per_sec": 108.063
+          "wall_time_s": 0.492,
+          "tokens_per_sec": 136.27
         }
       }
     },
@@ -71,16 +72,16 @@
           "num_new_tokens": 67,
           "avg_accept_length": 5.0,
           "total_accept": 55,
-          "wall_time_s": 0.434,
-          "tokens_per_sec": 154.49
+          "wall_time_s": 0.414,
+          "tokens_per_sec": 161.915
         },
         "cmr_on": {
           "num_iters": 11,
           "num_new_tokens": 67,
           "avg_accept_length": 5.0,
           "total_accept": 55,
-          "wall_time_s": 0.658,
-          "tokens_per_sec": 101.8
+          "wall_time_s": 0.492,
+          "tokens_per_sec": 136.281
         }
       }
     }
@@ -88,12 +89,12 @@
   "aggregate": {
     "cmr_off": {
       "mean_avg_accept_length": 5.0,
-      "mean_tokens_per_sec": 129.106,
+      "mean_tokens_per_sec": 150.224,
       "num_samples": 3
     },
     "cmr_on": {
       "mean_avg_accept_length": 5.0,
-      "mean_tokens_per_sec": 108.989,
+      "mean_tokens_per_sec": 135.909,
       "num_samples": 3
     }
   }
