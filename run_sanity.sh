@@ -74,12 +74,12 @@ python3 cmr_prototype.py \
     --compare_mode \
     --output_file sanity_A.json
 
-# 3. Sanity B: aggressive retrieval on the needle dataset.
+# 3. Sanity B: aggressive retrieval on the needle dataset (index-select path).
 #    top_k=32 chunks * chunk_size=32 = 1024-token working draft cache from 4K+ prefix.
-#    Expectation: cmr_on avg_accept_length close to cmr_off (draft still sees the
-#    needle chunk), demonstrating that the target's attention correctly localises
-#    the relevant chunk.
-echo "==== SANITY B: top_k=$TOP_K on needle dataset (SpecExtend classic setting) ===="
+#    Vanilla HF bakes RoPE into cached K at insertion time, so retained keys keep
+#    their original (potentially far-OOD) rotations. We expect cmr_on > cmr_off but
+#    the absolute numbers remain below the SpecExtend paper because of this.
+echo "==== SANITY B: top_k=$TOP_K on needle dataset (index-select; RoPE-at-insert) ===="
 python3 cmr_prototype.py \
     --target_model "$TARGET_MODEL" \
     --draft_model  "$DRAFT_MODEL" \
@@ -96,7 +96,53 @@ python3 cmr_prototype.py \
     --verbose \
     --output_file sanity_B.json
 
+# 4. Sanity C: same needle dataset + top_k as B, but with --cache_pre_rotate.
+#    Each CMR refresh re-prefills the draft on the selected tokens with contiguous
+#    position IDs, so RoPE stays in-distribution. Expectation: cmr_on (pre-rotate)
+#    >= cmr_on (index-select) from Sanity B, closing the gap vs. the SpecExtend paper.
+echo "==== SANITY C: top_k=$TOP_K on needle dataset (cache_pre_rotate; RoPE-at-query) ===="
+python3 cmr_prototype.py \
+    --target_model "$TARGET_MODEL" \
+    --draft_model  "$DRAFT_MODEL" \
+    --data sample_data/needle_4096.jsonl \
+    --max_samples 5 \
+    --max_prompt_tokens 5000 \
+    --max_new_tokens 32 \
+    --num_draft "$NUM_DRAFT" \
+    --chunk_size "$CHUNK_SIZE" \
+    --top_k_chunks "$TOP_K" \
+    --refresh_every "$REFRESH_EVERY" \
+    --dtype fp16 \
+    --compare_mode \
+    --cache_pre_rotate \
+    --verbose \
+    --output_file sanity_C.json
+
+# 5. Sanity A': cache_pre_rotate must ALSO be ~no-op when top_k covers all chunks.
+#    This checks that the re-prefill plumbing (virtual positions, commit accounting)
+#    is itself correct: re-prefilling on all positions in order with contiguous IDs
+#    should agree with a normal prefill, so cmr_on ~= cmr_off.
+echo "==== SANITY A': cache_pre_rotate + top_k=all (no-op check for re-prefill path) ===="
+python3 cmr_prototype.py \
+    --target_model "$TARGET_MODEL" \
+    --draft_model  "$DRAFT_MODEL" \
+    --data sample_data/repeat_4096.jsonl \
+    --max_samples 3 \
+    --max_prompt_tokens 5000 \
+    --max_new_tokens 64 \
+    --num_draft "$NUM_DRAFT" \
+    --chunk_size "$CHUNK_SIZE" \
+    --top_k_chunks 1000 \
+    --refresh_every "$REFRESH_EVERY" \
+    --dtype fp16 \
+    --compare_mode \
+    --cache_pre_rotate \
+    --output_file sanity_A_prerotate.json
+
 echo
 echo "Done."
-echo "  sanity_A.json : CMR no-op sanity check"
-echo "  sanity_B.json : CMR retrieval quality check (SpecExtend-classic setting)"
+echo "  sanity_0.json            : short-prompt correctness baseline"
+echo "  sanity_A.json            : CMR (index-select) no-op sanity check"
+echo "  sanity_A_prerotate.json  : CMR (cache_pre_rotate) no-op sanity check"
+echo "  sanity_B.json            : CMR (index-select) retrieval quality at long context"
+echo "  sanity_C.json            : CMR (cache_pre_rotate) retrieval quality at long context"

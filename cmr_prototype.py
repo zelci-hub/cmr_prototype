@@ -217,6 +217,43 @@ def chunks_to_positions(selected: List[Tuple[int, int]], device: torch.device) -
 
 
 # ---------------------------------------------------------------------------
+# Draft re-prefill (used by the cache_pre_rotate option)
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def prefill_draft_on_positions(
+    draft_model,
+    prefix_tokens: torch.Tensor,    # [1, last_pos], CPU long tensor: all committed tokens
+    positions: torch.Tensor,        # [S] CPU long tensor, strictly ascending, values in [0, last_pos)
+) -> KVCache:
+    """Re-prefill the draft model on the tokens at ``positions`` with CONTIGUOUS
+    position IDs ``[0, 1, ..., S-1]``.
+
+    This is the core of the ``cache_pre_rotate`` option: vanilla HuggingFace
+    LLaMA bakes RoPE into cached K at insertion time, so an ``index_select``
+    over positions like ``{13, 47, 3901, ...}`` leaves retained keys rotated
+    with far-out-of-distribution phases. By re-running the draft on just the
+    selected tokens with positions ``[0..S-1]``, RoPE is applied in-distribution
+    and the draft effectively sees a dense short-context virtual sequence.
+
+    The caller is responsible for choosing ``positions`` (e.g. from CMR top-k
+    selection) and for subsequently extending the returned cache with virtual
+    position IDs ``S, S+1, ...``.
+    """
+    dev = _in_dev(draft_model)
+    tokens = prefix_tokens.index_select(1, positions).to(dev)  # [1, S]
+    S = tokens.shape[1]
+    pos_ids = torch.arange(S, device=dev, dtype=torch.long).unsqueeze(0)
+    out = draft_model(
+        input_ids=tokens,
+        position_ids=pos_ids,
+        use_cache=True,
+        output_attentions=False,
+    )
+    return _to_legacy(out.past_key_values)
+
+
+# ---------------------------------------------------------------------------
 # Target attention extraction (for CMR refresh)
 # ---------------------------------------------------------------------------
 
@@ -407,6 +444,7 @@ def spec_generate(
     eos_token_id: Optional[int],
     *,
     use_cmr: bool,
+    cache_pre_rotate: bool = False,
     chunk_size: int = 32,
     top_k_chunks: int = 64,
     refresh_every: int = 4,
@@ -415,24 +453,47 @@ def spec_generate(
 ) -> SpecResult:
     """Run greedy speculative decoding with (optional) Cross-Model Retrieval.
 
+    Parameters of interest
+    ----------------------
+    use_cmr : bool
+        If True, every ``refresh_every`` iterations use the target's attention
+        over the prefix to select the top-k chunks for the draft to attend to.
+    cache_pre_rotate : bool
+        Only meaningful when ``use_cmr=True``. If True, on each CMR refresh
+        the draft is **re-prefilled** on the selected tokens with contiguous
+        position IDs ``[0..S-1]``, so RoPE is applied in-distribution rather
+        than carrying the original (potentially far-OOD) rotations of the
+        retained keys. Between refreshes, new tokens are appended with virtual
+        contiguous positions ``S, S+1, ...``. This corresponds to SpecExtend's
+        "store pre-RoPE K + reapply at query" behaviour, implemented purely
+        on top of vanilla HF by re-running the draft on each refresh.
+
     See module docstring for algorithm description.
     """
     dev_t = _in_dev(target_model)
     dev_d = _in_dev(draft_model)
     prompt_len = input_ids.shape[1]
 
+    pre_rotate = bool(use_cmr and cache_pre_rotate)  # sub-option of CMR
+
     # ==========================================================================
-    # INVARIANT maintained throughout this function:
-    #   full_target_kv and full_draft_kv contain KV for positions [0, last_pos).
-    #   They do NOT include `last_tok`. `last_tok` sits at position `last_pos`
-    #   and is re-fed as input on each drafting/verification/commit forward.
+    # Shared invariant:
+    #   full_target_kv always contains KV for real positions [0, last_pos).
+    #   It does NOT include ``last_tok`` (which sits at position ``last_pos``
+    #   and is re-fed as input on each drafting/verify/commit forward).
+    #
+    # Draft-side state depends on the mode:
+    #   * pre_rotate=False : full_draft_kv has real positions [0, last_pos);
+    #     CMR subselects via kv_index_select.
+    #   * pre_rotate=True  : full_draft_kv is unused. working_draft_kv holds
+    #     virtual-position KV:
+    #         [re-prefilled selection] + [tokens committed since refresh]
+    #     at contiguous virtual positions [0, virtual_base + commits_since_refresh).
+    #     virtual_last_pos = virtual_base + (last_pos - real_refresh_pos) is the
+    #     virtual position where ``last_tok`` sits as *input* (not in cache).
     # ==========================================================================
 
     # ---- Prefill target on the whole prompt ----
-    # After prefill the cache covers [0, prompt_len). Target's argmax at the last
-    # position of the prefill gives the first generated token (= new last_tok at
-    # position prompt_len). We do NOT commit it to the cache: the verify/draft
-    # loop will feed it back in naturally.
     ids_t = input_ids.to(dev_t)
     pos_prefill = torch.arange(prompt_len, device=dev_t, dtype=torch.long).unsqueeze(0)
     out_t = target_model(
@@ -444,42 +505,55 @@ def spec_generate(
     full_target_kv = _to_legacy(out_t.past_key_values)  # length prompt_len
     first_tok = torch.argmax(out_t.logits[:, -1, :], dim=-1, keepdim=True)  # [1, 1] on dev_t
 
-    # ---- Prefill draft on the prompt only (exclude first_tok per invariant) ----
-    ids_d = input_ids.to(dev_d)
-    pos_prefill_d = torch.arange(prompt_len, device=dev_d, dtype=torch.long).unsqueeze(0)
-    out_d = draft_model(
-        input_ids=ids_d,
-        position_ids=pos_prefill_d,
-        use_cache=True,
-        output_attentions=False,
-    )
-    full_draft_kv = _to_legacy(out_d.past_key_values)  # length prompt_len
+    # ---- Prefill draft on the prompt (skipped in pre-rotate mode: first CMR
+    #      refresh on iter 1 will build the working cache from scratch) ----
+    if not pre_rotate:
+        ids_d = input_ids.to(dev_d)
+        pos_prefill_d = torch.arange(prompt_len, device=dev_d, dtype=torch.long).unsqueeze(0)
+        out_d = draft_model(
+            input_ids=ids_d,
+            position_ids=pos_prefill_d,
+            use_cache=True,
+            output_attentions=False,
+        )
+        full_draft_kv = _to_legacy(out_d.past_key_values)  # length prompt_len
+    else:
+        full_draft_kv = None  # never touched in pre-rotate mode
+
+    # Running CPU tensor of committed tokens at real positions [0, last_pos).
+    # Needed by the pre_rotate path for re-prefill and harmless otherwise.
+    prefix_tokens = input_ids.detach().to("cpu")  # [1, prompt_len]
 
     # Keep the running generated buffer on CPU to avoid device mismatch on final cat.
     generated = [first_tok.detach().cpu()]
     accept_lens: List[int] = []
-    last_pos = prompt_len  # position where last_tok logically sits
+    last_pos = prompt_len  # real position where last_tok logically sits
     last_tok = first_tok
     new_tok_count = 1  # first_tok is our first generated token
     iters = 0
 
     # ---- CMR state ----
-    # `cached_selected_positions` holds the retrieved *prefix* positions from the last
-    # refresh (all strictly < last_pos_at_refresh). Between refreshes we also keep all
-    # positions in [refresh_last_pos, current_last_pos) as a "tail" so the draft can
-    # attend to recently-accepted tokens. We rebuild that tail on every iter.
+    # non-pre_rotate path:
+    #   cached_selected_positions  : 1D long tensor of prefix positions (CPU)
+    # pre_rotate path:
+    #   working_draft_kv           : KV at virtual positions [0, kv_len(working_draft_kv))
+    #   virtual_base               : kv_len(working_draft_kv) right after a refresh
+    #                                (= number of tokens re-prefilled)
+    #   real_refresh_pos           : value of last_pos at the most recent refresh
     cached_selected_positions: Optional[torch.Tensor] = None
+    working_draft_kv: Optional[KVCache] = None
+    virtual_base: int = 0
     refresh_last_pos: int = 0  # value of last_pos at the most recent refresh
+    real_refresh_pos: int = 0  # same, but used by the pre_rotate code path
     iters_since_refresh = math.inf  # force refresh on first iter if CMR is on
     start_time = time.time()
 
     while new_tok_count < max_new_tokens:
         iters += 1
 
-        # --- CMR: decide draft's working KV ---
-        # Under the new invariant full_draft_kv has length last_pos (does not contain
-        # last_tok). The selection indexes into [0, last_pos).
-        if use_cmr:
+        # --- CMR: decide draft's working KV and where ``last_tok`` sits ---
+        if use_cmr and not pre_rotate:
+            # Legacy index-select path. full_draft_kv covers [0, last_pos).
             need_refresh = iters_since_refresh >= refresh_every or cached_selected_positions is None
             if need_refresh and last_pos > chunk_size:
                 attn_over_prefix = get_last_query_attention(
@@ -499,14 +573,12 @@ def spec_generate(
                 iters_since_refresh = 0
                 if verbose:
                     print(
-                        f"  [CMR refresh] prefix={last_pos}, "
+                        f"  [CMR refresh | index-select] prefix={last_pos}, "
                         f"kept {len(sel_prefix)}/{last_pos} positions "
                         f"({len(selected)}/{len(chunks)} chunks)"
                     )
 
             if cached_selected_positions is not None:
-                # Full working selection = retrieved prefix positions + tail of positions
-                # newly committed since the last refresh. All entries in [0, last_pos).
                 if last_pos > refresh_last_pos:
                     tail = torch.arange(refresh_last_pos, last_pos, dtype=torch.long)
                     selection = torch.cat([cached_selected_positions, tail])
@@ -518,21 +590,58 @@ def spec_generate(
                     working_draft_kv = full_draft_kv
             else:
                 working_draft_kv = full_draft_kv
+            draft_start_position = last_pos
+
+        elif pre_rotate:
+            # Re-prefill path. working_draft_kv lives in virtual position space.
+            need_refresh = (
+                iters_since_refresh >= refresh_every
+                or working_draft_kv is None
+            )
+            if need_refresh:
+                if last_pos > chunk_size:
+                    attn_over_prefix = get_last_query_attention(
+                        target_model=target_model,
+                        full_target_kv=full_target_kv,
+                        last_token_id=last_tok,
+                        prefix_len=last_pos,
+                    )
+                    chunks = build_chunks(last_pos, chunk_size)
+                    chunk_scores = score_chunks(attn_over_prefix, chunks)
+                    selected = select_top_k_chunks(
+                        chunk_scores, chunks, top_k_chunks, always_keep_tail=recent_tail_chunks
+                    )
+                    sel_positions = chunks_to_positions(selected, device=torch.device("cpu"))
+                else:
+                    # Prefix too short to chunk meaningfully: just keep everything.
+                    sel_positions = torch.arange(last_pos, dtype=torch.long)
+                working_draft_kv = prefill_draft_on_positions(
+                    draft_model=draft_model,
+                    prefix_tokens=prefix_tokens,
+                    positions=sel_positions,
+                )
+                virtual_base = kv_len(working_draft_kv)  # == sel_positions.numel()
+                real_refresh_pos = last_pos
+                iters_since_refresh = 0
+                if verbose:
+                    print(
+                        f"  [CMR refresh | pre-rotate] prefix={last_pos}, "
+                        f"re-prefilled {virtual_base} positions with contiguous RoPE"
+                    )
+            draft_start_position = virtual_base + (last_pos - real_refresh_pos)
+
         else:
             working_draft_kv = full_draft_kv
+            draft_start_position = last_pos
 
         # --- Draft generates N candidate tokens ---
-        # draft_generate_N feeds last_tok as step 1 (appending one KV entry at
-        # position last_pos), then autoregresses num_draft tokens.
         draft_tokens, _new_draft_kv_unused = draft_generate_N(
             draft_model=draft_model,
             last_token_id=last_tok,
             working_past_kv=working_draft_kv,
             num_draft=num_draft,
-            start_position=last_pos,
+            start_position=draft_start_position,
         )
-        # The KV produced by drafting is discarded: it was computed against a
-        # (possibly reduced) working cache, not the full prefix.
 
         # --- Target verification (feeds [last_tok, *drafts], N+1 logits) ---
         accept_count, corrected_tok, full_target_kv = target_verify(
@@ -543,30 +652,46 @@ def spec_generate(
             prefix_len=last_pos,
         )
         accept_lens.append(accept_count)
-        # full_target_kv now has length last_pos + accept_count + 1 (= new last_pos):
-        # old prefix + last_tok + accepted drafts. corrected_tok is NOT in it yet.
 
-        # --- Commit to draft's full KV: [last_tok, *accepted_drafts] ---
-        # After the commit, full_draft_kv will match target's new length exactly and
-        # will not contain corrected_tok (which becomes the new last_tok).
+        # --- Commit the new tokens to the draft cache ---
+        # commit_tokens = [last_tok, *accepted_drafts], i.e. 1 + accept_count tokens.
+        # After commit the draft cache grows by exactly this many slots, and the
+        # new ``last_tok`` becomes corrected_tok (NOT in the cache).
         commit_parts = [last_tok.to(dev_d)]
         if accept_count > 0:
             commit_parts.append(draft_tokens[:, :accept_count].to(dev_d))
         commit_tokens = torch.cat(commit_parts, dim=1)  # [1, 1 + accept_count]
-        commit_positions = torch.arange(
-            last_pos, last_pos + commit_tokens.shape[1], device=dev_d, dtype=torch.long
-        ).unsqueeze(0)
-        out_draft_commit = draft_model(
-            input_ids=commit_tokens,
-            past_key_values=full_draft_kv,
-            position_ids=commit_positions,
-            use_cache=True,
-            output_attentions=False,
-        )
-        full_draft_kv = _to_legacy(out_draft_commit.past_key_values)
 
-        # --- Record newly generated tokens ---
-        # Tokens the user sees this iter = accepted drafts + corrected_tok.
+        if pre_rotate:
+            commit_start_virtual = virtual_base + (last_pos - real_refresh_pos)
+            commit_positions = torch.arange(
+                commit_start_virtual,
+                commit_start_virtual + commit_tokens.shape[1],
+                device=dev_d, dtype=torch.long,
+            ).unsqueeze(0)
+            out_draft_commit = draft_model(
+                input_ids=commit_tokens,
+                past_key_values=working_draft_kv,
+                position_ids=commit_positions,
+                use_cache=True,
+                output_attentions=False,
+            )
+            working_draft_kv = _to_legacy(out_draft_commit.past_key_values)
+        else:
+            commit_positions = torch.arange(
+                last_pos, last_pos + commit_tokens.shape[1],
+                device=dev_d, dtype=torch.long,
+            ).unsqueeze(0)
+            out_draft_commit = draft_model(
+                input_ids=commit_tokens,
+                past_key_values=full_draft_kv,
+                position_ids=commit_positions,
+                use_cache=True,
+                output_attentions=False,
+            )
+            full_draft_kv = _to_legacy(out_draft_commit.past_key_values)
+
+        # --- Record newly generated tokens and advance state ---
         newly_generated_parts = []
         if accept_count > 0:
             newly_generated_parts.append(draft_tokens[:, :accept_count].detach().cpu())
@@ -575,7 +700,9 @@ def spec_generate(
         generated.append(newly_generated)
         new_tok_count += newly_generated.shape[1]
 
-        # Advance loop state. new last_tok = corrected_tok at position new_last_pos.
+        # Extend prefix_tokens with the just-committed tokens (NOT corrected_tok).
+        prefix_tokens = torch.cat([prefix_tokens, commit_tokens.detach().cpu()], dim=1)
+
         last_pos = last_pos + accept_count + 1
         last_tok = corrected_tok
         iters_since_refresh += 1
@@ -644,6 +771,12 @@ def main():
                    help="Number of trailing chunks to always force-include in the working cache.")
     p.add_argument("--compare_mode", action="store_true",
                    help="Run both with and without CMR and report both.")
+    p.add_argument("--cache_pre_rotate", action="store_true",
+                   help=("On each CMR refresh, re-prefill the draft on the selected "
+                         "tokens with contiguous position IDs so RoPE is applied "
+                         "in-distribution instead of carrying the original "
+                         "(potentially far-OOD) rotations of retained keys. "
+                         "Only meaningful together with CMR; ignored when CMR is off."))
     p.add_argument("--dtype", choices=["bf16", "fp16", "fp32"], default="bf16")
     p.add_argument("--device_map", default="auto")
     p.add_argument("--output_file", default="cmr_prototype_results.json")
@@ -716,6 +849,7 @@ def main():
                 num_draft=args.num_draft,
                 eos_token_id=eos_id,
                 use_cmr=use_cmr,
+                cache_pre_rotate=args.cache_pre_rotate,
                 chunk_size=args.chunk_size,
                 top_k_chunks=args.top_k_chunks,
                 refresh_every=args.refresh_every,
